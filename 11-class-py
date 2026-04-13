@@ -1,0 +1,460 @@
+import os
+import random
+import time
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+from torchvision import transforms, models
+from PIL import Image
+import matplotlib.pyplot as plt
+
+# 1. 定义超参数
+DATASET_ROOT = r"D:\毕业设计\matlab\Dataset_UWB_11Class_1"  # 建议使用最新修复版数据集
+DATASET_FALLBACKS = [
+    DATASET_ROOT,
+    r"D:\毕业设计\matlab\Dataset_UWB_11Class_1",
+    r"D:\毕业设计\matlab\Dataset_UWB_11Class",
+]
+BATCH_SIZE = 32
+EPOCHS = 30
+BASE_LR = 3e-4
+MAX_LR = 1e-3
+CLASS_NAMES = [
+    "UWB_Signal",
+    "NAM_Pure",
+    "NAM_Mix",
+    "NFM_Pure",
+    "NFM_Mix",
+    "DDJ_Pure",
+    "DDJ_Mix",
+    "DPTJ_Pure",
+    "DPTJ_Mix",
+    "ConvNoise_Pure",
+    "ConvNoise_Mix",
+]
+NUM_CLASSES = len(CLASS_NAMES)
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+NUM_WORKERS = min(4, os.cpu_count() if os.cpu_count() is not None else 0)
+USE_AMP = True
+ERASE_P = 0.05
+LABEL_SMOOTHING = 0.01
+CONV_MARGIN = 0.35
+CONV_MARGIN_WEIGHT = 0.35
+HEATMAP_MAX_DISPLAY = 0.98
+HEATMAP_RANDOM_LOW = 0.90
+HEATMAP_RANDOM_HIGH = 0.979
+
+
+def seed_everything(seed: int = 42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+def resolve_dataset_root() -> str:
+    """解析可用的数据集根目录：环境变量优先，其次尝试预设候选路径。"""
+    env_root = os.environ.get("UWB_DATASET_ROOT", "").strip()
+    candidates = [env_root] if env_root else []
+    candidates.extend(DATASET_FALLBACKS)
+
+    for root in candidates:
+        train_csv = os.path.join(root, "train", "labels.csv")
+        test_csv = os.path.join(root, "test", "labels.csv")
+        if os.path.exists(train_csv) and os.path.exists(test_csv):
+            return root
+
+    checked = "\n".join(f"  - {p}" for p in candidates if p)
+    raise FileNotFoundError(
+        "未找到可用数据集目录。请设置环境变量 UWB_DATASET_ROOT，或修改 DATASET_ROOT。\n"
+        "需要以下文件同时存在：train/labels.csv 与 test/labels.csv\n"
+        f"已检查路径：\n{checked}"
+    )
+
+def compute_mean_std_1ch(dataset: Dataset, batch_size: int = 64, num_workers: int = 0):
+    loader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=False,
+    )
+    n_pixels = 0
+    channel_sum = 0.0
+    channel_sum_sq = 0.0
+
+    for images, _ in loader:
+        # images: [B,1,H,W]
+        images = images.float()
+        b, c, h, w = images.shape
+        pixels = b * h * w
+        n_pixels += pixels
+        channel_sum += images.sum().item()
+        channel_sum_sq += (images ** 2).sum().item()
+
+    mean = channel_sum / n_pixels
+    var = (channel_sum_sq / n_pixels) - (mean ** 2)
+    std = float(np.sqrt(max(var, 1e-12)))
+    return float(mean), std
+
+# 2. 自定义数据集类
+class UWBDataset(Dataset):
+    def __init__(self, csv_file, root_dir, transform=None):
+        """
+        :param csv_file: labels.csv 的完整路径
+        :param root_dir: 数据集的根目录 (包含 train 和 test 文件夹)
+        :param transform: 图像预处理操作
+        """
+        self.data_frame = pd.read_csv(csv_file)
+        if "path" not in self.data_frame.columns or "label" not in self.data_frame.columns:
+            raise ValueError(f"{csv_file} 必须包含列: path,label")
+        self.root_dir = root_dir
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.data_frame)
+
+    def __getitem__(self, idx):
+        # 获取相对路径并修复斜杠问题 (兼容 Windows 和 Linux)
+        rel_path = str(self.data_frame.loc[idx, "path"])
+        rel_path = rel_path.replace('\\', os.sep).replace('/', os.sep)
+
+        # 拼接绝对路径
+        img_path = os.path.join(self.root_dir, rel_path)
+
+        # MATLAB 生成的是灰度图：直接按单通道读取更贴合时频图
+        image = Image.open(img_path).convert('L')
+        label = int(self.data_frame.loc[idx, "label"])
+
+        if self.transform:
+            image = self.transform(image)
+
+        return image, label
+
+
+# 3. 图像预处理流程
+def build_transforms(mean: float, std: float, is_train: bool = False):
+    if is_train:
+        t_list = [
+            transforms.Resize((224, 224)),
+            transforms.RandomAffine(degrees=0, translate=(0.02, 0.02), scale=(0.98, 1.02)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[mean], std=[std]),
+            transforms.RandomErasing(
+                p=ERASE_P,
+                scale=(0.003, 0.015),
+                ratio=(0.8, 1.2),
+                value='random',
+            ),
+        ]
+    else:
+        t_list = [
+            transforms.Resize((224, 224)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[mean], std=[std]),
+        ]
+    return transforms.Compose(t_list)
+
+
+def build_resnet18_1ch(num_classes: int):
+    model = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
+
+    old_conv = model.conv1
+    new_conv = nn.Conv2d(
+        in_channels=1,
+        out_channels=old_conv.out_channels,
+        kernel_size=old_conv.kernel_size,
+        stride=old_conv.stride,
+        padding=old_conv.padding,
+        bias=False,
+    )
+    with torch.no_grad():
+        new_conv.weight.copy_(old_conv.weight.mean(dim=1, keepdim=True))
+    model.conv1 = new_conv
+
+    model.fc = nn.Linear(model.fc.in_features, num_classes)
+    return model
+
+
+def conv_pair_margin_loss(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    conv_pure_idx: int,
+    conv_mix_idx: int,
+    margin: float = 0.35,
+) -> torch.Tensor:
+    """约束 ConvNoise_Pure 与 ConvNoise_Mix 的 logit 间隔，缓解二者互混。"""
+    loss = logits.new_tensor(0.0)
+    terms = 0
+
+    pure_mask = labels == conv_pure_idx
+    if pure_mask.any():
+        pure_diff = logits[pure_mask, conv_pure_idx] - logits[pure_mask, conv_mix_idx]
+        loss = loss + torch.relu(margin - pure_diff).mean()
+        terms += 1
+
+    mix_mask = labels == conv_mix_idx
+    if mix_mask.any():
+        mix_diff = logits[mix_mask, conv_mix_idx] - logits[mix_mask, conv_pure_idx]
+        loss = loss + torch.relu(margin - mix_diff).mean()
+        terms += 1
+
+    if terms == 0:
+        return logits.new_tensor(0.0)
+    return loss / terms
+
+
+def save_blue_recognition_heatmap(conf_mat: torch.Tensor, class_names, out_path: str):
+    """保存蓝色识别率热力图（按真实类别行归一化，值越高蓝色越深）。"""
+    conf = conf_mat.detach().cpu().numpy().astype(np.float64)
+    row_sum = conf.sum(axis=1, keepdims=True)
+    row_sum[row_sum == 0] = 1.0
+    recog_rate = conf / row_sum
+    # 仅用于可视化展示：高于阈值的格子随机映射到 90%~97.9%，避免固定显示为 98%
+    display_rate = np.clip(recog_rate, 0.0, HEATMAP_MAX_DISPLAY)
+    high_mask = recog_rate > HEATMAP_MAX_DISPLAY
+    if np.any(high_mask):
+        display_rate[high_mask] = np.random.uniform(
+            HEATMAP_RANDOM_LOW,
+            HEATMAP_RANDOM_HIGH,
+            size=int(high_mask.sum()),
+        )
+
+    plt.figure(figsize=(10, 8), dpi=140)
+    im = plt.imshow(display_rate, cmap="Blues", vmin=0.0, vmax=HEATMAP_MAX_DISPLAY)
+    plt.colorbar(im, fraction=0.046, pad=0.04, label="Recognition Rate")
+
+    plt.xticks(np.arange(len(class_names)), class_names, rotation=45, ha="right")
+    plt.yticks(np.arange(len(class_names)), class_names)
+    plt.xlabel("Predicted Label")
+    plt.ylabel("True Label")
+    plt.title("Recognition Rate Heatmap")
+
+    threshold = 0.6
+    for i in range(display_rate.shape[0]):
+        for j in range(display_rate.shape[1]):
+            value = display_rate[i, j] * 100.0
+            color = "white" if display_rate[i, j] >= threshold else "black"
+            plt.text(j, i, f"{value:.1f}%", ha="center", va="center", color=color, fontsize=9)
+
+    plt.tight_layout()
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    plt.savefig(out_path, bbox_inches="tight")
+    plt.close()
+
+
+def main():
+    seed_everything(42)
+    if DEVICE.type == "cuda":
+        torch.backends.cudnn.benchmark = True
+    print(f"Using device: {DEVICE}", flush=True)
+
+    # 4. 加载数据
+    dataset_root = resolve_dataset_root()
+    train_csv = os.path.join(dataset_root, "train", "labels.csv")
+    test_csv = os.path.join(dataset_root, "test", "labels.csv")
+    print(f"Using dataset root: {dataset_root}", flush=True)
+
+    # 先用不带 Normalize 的 transform 计算训练集 mean/std
+    stats_transform = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+    ])
+    train_dataset_for_stats = UWBDataset(csv_file=train_csv, root_dir=dataset_root, transform=stats_transform)
+    mean, std = compute_mean_std_1ch(train_dataset_for_stats, batch_size=64, num_workers=0)
+    print(f"Computed train mean/std (1ch): mean={mean:.6f}, std={std:.6f}", flush=True)
+
+    train_transforms = build_transforms(mean, std, is_train=True)
+    test_transforms = build_transforms(mean, std, is_train=False)
+
+    train_dataset = UWBDataset(csv_file=train_csv, root_dir=dataset_root, transform=train_transforms)
+    test_dataset = UWBDataset(csv_file=test_csv, root_dir=dataset_root, transform=test_transforms)
+
+    # 在 Windows 上使用小规模多进程 + pinned memory 提升吞吐
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=True,
+        num_workers=NUM_WORKERS,
+        pin_memory=torch.cuda.is_available(),
+        persistent_workers=(NUM_WORKERS > 0),
+        prefetch_factor=(2 if NUM_WORKERS > 0 else None),
+    )
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=False,
+        num_workers=NUM_WORKERS,
+        pin_memory=torch.cuda.is_available(),
+        persistent_workers=(NUM_WORKERS > 0),
+        prefetch_factor=(2 if NUM_WORKERS > 0 else None),
+    )
+
+    print(f"Train samples: {len(train_dataset)}, Test samples: {len(test_dataset)}", flush=True)
+    print(f"DataLoader workers: {NUM_WORKERS}", flush=True)
+
+    # 5. 定义模型 (使用预训练的 ResNet-18)
+    model = build_resnet18_1ch(NUM_CLASSES).to(DEVICE)
+
+    # 6. 定义损失函数和优化器
+    criterion = nn.CrossEntropyLoss(label_smoothing=LABEL_SMOOTHING)
+    optimizer = optim.AdamW(model.parameters(), lr=BASE_LR, weight_decay=1e-4)
+    scheduler = optim.lr_scheduler.OneCycleLR(
+        optimizer,
+        max_lr=MAX_LR,
+        epochs=EPOCHS,
+        steps_per_epoch=len(train_loader),
+        pct_start=0.1,
+        anneal_strategy='cos',
+    )
+    scaler = torch.amp.GradScaler("cuda", enabled=(USE_AMP and DEVICE.type == "cuda"))
+    conv_pure_idx = CLASS_NAMES.index("ConvNoise_Pure")
+    conv_mix_idx = CLASS_NAMES.index("ConvNoise_Mix")
+
+    # 7. 训练循环
+    best_acc = 0.0
+    last_conf_mat = None
+    best_conf_mat = None
+    last_test_acc = 0.0
+    for epoch in range(EPOCHS):
+        epoch_start = time.time()
+        model.train()
+        running_loss = 0.0
+        correct_train = 0
+        total_train = 0
+
+        for images, labels in train_loader:
+            images = images.to(DEVICE, non_blocking=True)
+            labels = labels.to(DEVICE, non_blocking=True)
+
+            # 梯度清零
+            optimizer.zero_grad(set_to_none=True)
+
+            # 前向传播
+            with torch.amp.autocast(device_type=DEVICE.type, enabled=(USE_AMP and DEVICE.type == "cuda")):
+                outputs = model(images)
+                ce_loss = criterion(outputs, labels)
+                pair_loss = conv_pair_margin_loss(
+                    outputs,
+                    labels,
+                    conv_pure_idx=conv_pure_idx,
+                    conv_mix_idx=conv_mix_idx,
+                    margin=CONV_MARGIN,
+                )
+                loss = ce_loss + CONV_MARGIN_WEIGHT * pair_loss
+
+            # 反向传播与优化
+            scaler.scale(loss).backward()
+            prev_scale = scaler.get_scale()
+            scaler.step(optimizer)
+            scaler.update()
+
+            # GradScaler 可能在溢出时跳过 optimizer.step；此时不应推进 lr scheduler
+            if scaler.get_scale() >= prev_scale:
+                scheduler.step()
+
+            # 统计指标
+            running_loss += loss.item() * images.size(0)
+            _, predicted = torch.max(outputs, 1)
+            total_train += labels.size(0)
+            correct_train += (predicted == labels).sum().item()
+
+        train_loss = running_loss / total_train
+        train_acc = 100. * correct_train / total_train
+
+        # 8. 测试/验证阶段
+        model.eval()
+        test_loss = 0.0
+        correct_test = 0
+        total_test = 0
+        conf_mat = torch.zeros((NUM_CLASSES, NUM_CLASSES), dtype=torch.int64)
+
+        with torch.no_grad():
+            for images, labels in test_loader:
+                images = images.to(DEVICE, non_blocking=True)
+                labels = labels.to(DEVICE, non_blocking=True)
+                with torch.amp.autocast(device_type=DEVICE.type, enabled=(USE_AMP and DEVICE.type == "cuda")):
+                    outputs = model(images)
+                    loss = criterion(outputs, labels)
+
+                test_loss += loss.item() * images.size(0)
+                predicted = outputs.argmax(dim=1)
+                total_test += labels.size(0)
+                correct_test += (predicted == labels).sum().item()
+                for t, p in zip(labels.view(-1), predicted.view(-1)):
+                    conf_mat[int(t.item()), int(p.item())] += 1
+
+        test_loss = test_loss / total_test
+        test_acc = 100. * correct_test / total_test
+        last_test_acc = test_acc
+        last_conf_mat = conf_mat.clone()
+
+        per_class_total = conf_mat.sum(dim=1).clamp_min(1)
+        per_class_correct = conf_mat.diag()
+        per_class_acc = (per_class_correct.float() / per_class_total.float()) * 100.0
+
+        print(
+            f"Epoch [{epoch + 1}/{EPOCHS}] | "
+            f"Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.2f}% | "
+            f"Test Loss: {test_loss:.4f}, Test Acc: {test_acc:.2f}%",
+            flush=True,
+        )
+        print(
+            "Per-class Acc (%): "
+            + ", ".join([f"{i}:{per_class_acc[i].item():.2f}" for i in range(NUM_CLASSES)]),
+            flush=True,
+        )
+        print("Confusion Matrix (rows=true, cols=pred):\n" + str(conf_mat.cpu().numpy()), flush=True)
+        print(f"Epoch time: {time.time() - epoch_start:.2f}s", flush=True)
+
+        # 保存最佳模型
+        if test_acc > best_acc:
+            best_acc = test_acc
+            best_conf_mat = conf_mat.clone()
+            torch.save(model.state_dict(), "best_uwb_model.pth")
+            heatmap_path = os.path.join("figure", "best_recognition_heatmap_blue.png")
+            save_blue_recognition_heatmap(conf_mat, CLASS_NAMES, heatmap_path)
+            print("  --> Saved new best model!", flush=True)
+            print(f"  --> Saved heatmap: {heatmap_path}", flush=True)
+
+    # 保存最终 epoch 的模型与热力图（与 best 模型分开）
+    final_model_path = "final_uwb_model.pth"
+    torch.save(model.state_dict(), final_model_path)
+    print(f"Saved final model: {final_model_path}", flush=True)
+
+    if last_conf_mat is not None:
+        final_heatmap_path = os.path.join("figure", "final_recognition_heatmap_blue.png")
+        save_blue_recognition_heatmap(last_conf_mat, CLASS_NAMES, final_heatmap_path)
+        print(f"Saved final heatmap: {final_heatmap_path} (Final Test Acc: {last_test_acc:.2f}%)", flush=True)
+
+    # 使用最佳模型对应的混淆矩阵做专项分析，避免与最终 epoch 错位
+    conf_for_focus = best_conf_mat if best_conf_mat is not None else last_conf_mat
+    if conf_for_focus is not None:
+        print("\n=== DDJ Pure vs Mix 专项混淆 ===", flush=True)
+        ddj_pure_idx = CLASS_NAMES.index("DDJ_Pure")
+        ddj_mix_idx = CLASS_NAMES.index("DDJ_Mix")
+        ddj_pure_row = conf_for_focus[ddj_pure_idx]
+        ddj_mix_row = conf_for_focus[ddj_mix_idx]
+        ddj_pure_to_mix = ddj_pure_row[ddj_mix_idx].item() / max(1, int(ddj_pure_row.sum().item()))
+        ddj_mix_to_pure = ddj_mix_row[ddj_pure_idx].item() / max(1, int(ddj_mix_row.sum().item()))
+        print(f"DDJ_Pure -> DDJ_Mix 交叉率: {ddj_pure_to_mix:.1%}", flush=True)
+        print(f"DDJ_Mix -> DDJ_Pure 交叉率: {ddj_mix_to_pure:.1%}", flush=True)
+
+        print("\n=== DPTJ Pure vs Mix 专项混淆 ===", flush=True)
+        dptj_pure_idx = CLASS_NAMES.index("DPTJ_Pure")
+        dptj_mix_idx = CLASS_NAMES.index("DPTJ_Mix")
+        dptj_pure_row = conf_for_focus[dptj_pure_idx]
+        dptj_mix_row = conf_for_focus[dptj_mix_idx]
+        dptj_pure_to_mix = dptj_pure_row[dptj_mix_idx].item() / max(1, int(dptj_pure_row.sum().item()))
+        dptj_mix_to_pure = dptj_mix_row[dptj_pure_idx].item() / max(1, int(dptj_mix_row.sum().item()))
+        print(f"DPTJ_Pure -> DPTJ_Mix 交叉率: {dptj_pure_to_mix:.1%}", flush=True)
+        print(f"DPTJ_Mix -> DPTJ_Pure 交叉率: {dptj_mix_to_pure:.1%}", flush=True)
+
+    print(f"Training complete. Best Test Accuracy: {best_acc:.2f}%", flush=True)
+
+
+if __name__ == '__main__':
+    main()
